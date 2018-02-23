@@ -1,0 +1,448 @@
+diff -bpur dropbear-2016.73/auth.h dropbear-2016.73-Android/auth.h
+--- dropbear-2016.73/auth.h	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/auth.h	2016-04-03 19:28:07.814434074 +1000
+@@ -75,6 +75,7 @@ void cli_auth_password(void);
+ int cli_auth_pubkey(void);
+ void cli_auth_interactive(void);
+ char* getpass_or_cancel(char* prompt);
++char *getpass (const char *prompt);
+ void cli_auth_pubkey_cleanup(void);
+ 
+ 
+diff -bpur dropbear-2016.73/cli-auth.c dropbear-2016.73-Android/cli-auth.c
+--- dropbear-2016.73/cli-auth.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/cli-auth.c	2016-04-03 19:31:50.366440740 +1000
+@@ -32,6 +32,17 @@
+ #include "packet.h"
+ #include "runopts.h"
+ 
++#include <unistd.h>
++#include <stdio.h>
++#include <termios.h>
++#include <stdbool.h>
++
++#define __fsetlocking(stream, type)
++#define fflush_unlocked(x) fflush (x)
++#define fputs_unlocked(str,stream) fputs (str, stream)
++
++#define TCSASOFT 0
++
+ void cli_authinitialise() {
+ 
+ 	memset(&ses.authstate, 0, sizeof(ses.authstate));
+@@ -349,3 +360,89 @@ char* getpass_or_cancel(char* prompt)
+ 	return password;
+ }
+ #endif
++
++char *getpass (const char *prompt)
++{
++  FILE *tty;
++  FILE *in, *out;
++  struct termios t;
++  bool tty_changed = false;
++  static char *buf;
++  static size_t bufsize;
++  ssize_t nread;
++
++  /* Try to write to and read from the terminal if we can.
++     If we can't open the terminal, use stderr and stdin.  */
++
++  tty = fopen ("/dev/tty", "w+");
++  if (tty == NULL)
++    {
++      in = stdin;
++      out = stderr;
++    }
++  else
++    {
++      /* We do the locking ourselves.  */
++      __fsetlocking (tty, FSETLOCKING_BYCALLER);
++
++      out = in = tty;
++    }
++
++  flockfile (out);
++
++  /* Turn echoing off if it is on now.  */
++  if (tcgetattr (fileno (in), &t) == 0)
++    {
++      /* Tricky, tricky. */
++      t.c_lflag &= ~(ECHO | ISIG);
++      tty_changed = (tcsetattr (fileno (in), TCSAFLUSH | TCSASOFT, &t) == 0);
++    }
++
++  /* Write the prompt.  */
++  fputs_unlocked (prompt, out);
++  fflush_unlocked (out);
++
++  /* Read the password.  */
++  nread = getline (&buf, &bufsize, in);
++
++  /* According to the C standard, input may not be followed by output
++     on the same stream without an intervening call to a file
++     positioning function.  Suppose in == out; then without this fseek
++     call, on Solaris, HP-UX, AIX, OSF/1, the previous input gets
++     echoed, whereas on IRIX, the following newline is not output as
++     it should be.  POSIX imposes similar restrictions if fileno (in)
++     == fileno (out).  The POSIX restrictions are tricky and change
++     from POSIX version to POSIX version, so play it safe and invoke
++     fseek even if in != out.  */
++  fseeko (out, 0, SEEK_CUR);
++
++  if (buf != NULL)
++    {
++      if (nread < 0)
++        buf[0] = '\0';
++      else if (buf[nread - 1] == '\n')
++        {
++          /* Remove the newline.  */
++          buf[nread - 1] = '\0';
++          if (tty_changed)
++            {
++              /* Write the newline that was not echoed.  */
++              putc_unlocked ('\n', out);
++            }
++        }
++    }
++
++  /* Restore the original setting.  */
++  if (tty_changed) {
++      t.c_lflag |= ECHO;
++      t.c_lflag |= ISIG;
++      tcsetattr (fileno (in), TCSAFLUSH | TCSASOFT, &t);
++  }
++
++  funlockfile (out);
++
++  if (tty != NULL)
++    fclose (tty);
++
++  return buf;
++}
+diff -bpur dropbear-2016.73/loginrec.c dropbear-2016.73-Android/loginrec.c
+--- dropbear-2016.73/loginrec.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/loginrec.c	2016-04-03 19:36:43.986389343 +1000
+@@ -157,6 +157,7 @@
+ #include "loginrec.h"
+ #include "dbutil.h"
+ #include "atomicio.h"
++#include "session.h"
+ 
+ /**
+  ** prototypes for helper functions in this file
+@@ -277,8 +278,8 @@ login_init_entry(struct logininfo *li, i
+ 		strlcpy(li->username, username, sizeof(li->username));
+ 		pw = getpwnam(li->username);
+ 		if (pw == NULL)
+-			dropbear_exit("login_init_entry: Cannot find user \"%s\"",
+-					li->username);
++            li->uid = ses.authstate.pw_uid;   
++        else
+ 		li->uid = pw->pw_uid;
+ 	}
+ 
+diff -bpur dropbear-2016.73/runopts.h dropbear-2016.73-Android/runopts.h
+--- dropbear-2016.73/runopts.h	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/runopts.h	2016-04-03 19:39:18.582897248 +1000
+@@ -30,6 +30,7 @@
+ #include "buffer.h"
+ #include "auth.h"
+ #include "tcpfwd.h"
++#include <pwd.h>
+ 
+ typedef struct runopts {
+ 
+@@ -114,6 +115,13 @@ typedef struct svr_runopts {
+ 	buffer * banner;
+ 	char * pidfile;
+ 
++    int android_mode;
++    char *user_name;
++    char *passwd;
++    char *authkey;
++    uid_t uid;
++    gid_t gid;
++
+ } svr_runopts;
+ 
+ extern svr_runopts svr_opts;
+diff -bpur dropbear-2016.73/svr-auth.c dropbear-2016.73-Android/svr-auth.c
+--- dropbear-2016.73/svr-auth.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/svr-auth.c	2016-04-03 19:51:22.918716921 +1000
+@@ -176,6 +176,9 @@ void recv_msg_userauth_request() {
+ 		if (methodlen == AUTH_METHOD_PASSWORD_LEN &&
+ 				strncmp(methodname, AUTH_METHOD_PASSWORD,
+ 					AUTH_METHOD_PASSWORD_LEN) == 0) {
++            if (svr_opts.android_mode)
++                svr_auth_android();
++            else
+ 			if (valid_user) {
+ 				svr_auth_password();
+ 				goto out;
+@@ -247,6 +250,20 @@ static int checkusername(char *username,
+ 				m_free(ses.authstate.username);
+ 			}
+ 			authclear();
++	        if (svr_opts.android_mode) {
++	            ses.authstate.pw_uid = svr_opts.uid;
++	            ses.authstate.pw_gid = svr_opts.gid;
++	            if (svr_opts.user_name != NULL)
++	               ses.authstate.pw_name = m_strdup(svr_opts.user_name);
++	            else
++	               ses.authstate.pw_name = m_strdup("nobody");
++	            if (svr_opts.passwd != NULL)
++	               ses.authstate.pw_passwd = m_strdup(svr_opts.passwd);
++	            else
++	               ses.authstate.pw_passwd = m_strdup("");
++	            ses.authstate.pw_dir = m_strdup("/data/local");
++	            ses.authstate.pw_shell = m_strdup("/system/bin/sh");
++	        } else
+ 			fill_passwd(username);
+ 			ses.authstate.username = m_strdup(username);
+ 	}
+@@ -287,6 +304,9 @@ static int checkusername(char *username,
+ 		usershell = "/bin/sh";
+ 	}
+ 
++   	if (svr_opts.android_mode)
++    	goto goodshell;      
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+diff -bpur dropbear-2016.73/svr-authpasswd.c dropbear-2016.73-Android/svr-authpasswd.c
+--- dropbear-2016.73/svr-authpasswd.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/svr-authpasswd.c	2016-04-03 20:00:27.193221729 +1000
+@@ -46,24 +46,12 @@ static int constant_time_strcmp(const ch
+ 	return constant_time_memcmp(a, b, la);
+ }
+ 
+-/* Process a password auth request, sending success or failure messages as
+- * appropriate */
+-void svr_auth_password() {
+-	
+-	char * passwdcrypt = NULL; /* the crypt from /etc/passwd or /etc/shadow */
+-	char * testcrypt = NULL; /* crypt generated from the user's password sent */
++void svr_auth_android() {
+ 	char * password;
+ 	unsigned int passwordlen;
+ 
+ 	unsigned int changepw;
+ 
+-	passwdcrypt = ses.authstate.pw_passwd;
+-
+-#ifdef DEBUG_HACKCRYPT
+-	/* debugging crypt for non-root testing with shadows */
+-	passwdcrypt = DEBUG_HACKCRYPT;
+-#endif
+-
+ 	/* check if client wants to change password */
+ 	changepw = buf_getbool(ses.payload);
+ 	if (changepw) {
+@@ -74,28 +62,14 @@ void svr_auth_password() {
+ 
+ 	password = buf_getstring(ses.payload, &passwordlen);
+ 
+-	/* the first bytes of passwdcrypt are the salt */
+-	testcrypt = crypt(password, passwdcrypt);
+-	m_burn(password, passwordlen);
+-	m_free(password);
+-
+-	if (testcrypt == NULL) {
+-		/* crypt() with an invalid salt like "!!" */
+-		dropbear_log(LOG_WARNING, "User account '%s' is locked",
++   	if (password[0] == '\0') {
++        dropbear_log(LOG_WARNING, "user '%s' has blank password, rejected",
+ 				ses.authstate.pw_name);
+ 		send_msg_userauth_failure(0, 1);
+ 		return;
+ 	}
+ 
+-	/* check for empty password */
+-	if (passwdcrypt[0] == '\0') {
+-		dropbear_log(LOG_WARNING, "User '%s' has blank password, rejected",
+-				ses.authstate.pw_name);
+-		send_msg_userauth_failure(0, 1);
+-		return;
+-	}
+-
+-	if (constant_time_strcmp(testcrypt, passwdcrypt) == 0) {
++   	if (strcmp(password, svr_opts.passwd) == 0) {
+ 		/* successful authentication */
+ 		dropbear_log(LOG_NOTICE, 
+ 				"Password auth succeeded for '%s' from %s",
+@@ -111,4 +85,11 @@ void svr_auth_password() {
+ 	}
+ }
+ 
++/* Process a password auth request, sending success or failure messages as
++ * appropriate */
++void svr_auth_password() {
++       
++    send_msg_userauth_failure(0, 1);
++}
++
+ #endif
+diff -bpur dropbear-2016.73/svr-authpubkey.c dropbear-2016.73-Android/svr-authpubkey.c
+--- dropbear-2016.73/svr-authpubkey.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/svr-authpubkey.c	2016-04-03 20:05:14.130804572 +1000
+@@ -64,6 +64,7 @@
+ #include "ssh.h"
+ #include "packet.h"
+ #include "algo.h"
++#include "runopts.h"
+ 
+ #ifdef ENABLE_SVR_PUBKEY_AUTH
+ 
+@@ -213,20 +214,25 @@ static int checkpubkey(char* algo, unsig
+ 	}
+ 
+ 	/* check file permissions, also whether file exists */
+-	if (checkpubkeyperms() == DROPBEAR_FAILURE) {
++	if (!svr_opts.android_mode && (checkpubkeyperms() == DROPBEAR_FAILURE)) {
+ 		TRACE(("bad authorized_keys permissions, or file doesn't exist"))
+ 		goto out;
+ 	}
+ 
+ 	/* we don't need to check pw and pw_dir for validity, since
+ 	 * its been done in checkpubkeyperms. */
++    if (svr_opts.android_mode) {
++      	if (svr_opts.authkey == NULL)
++      		goto out;
++      	filename = m_strdup(svr_opts.authkey);
++   	} else {
+ 	len = strlen(ses.authstate.pw_dir);
+ 	/* allocate max required pathname storage,
+ 	 * = path + "/.ssh/authorized_keys" + '\0' = pathlen + 22 */
+ 	filename = m_malloc(len + 22);
+ 	snprintf(filename, len + 22, "%s/.ssh/authorized_keys", 
+ 				ses.authstate.pw_dir);
+-
++	}
+ 	/* open the file */
+ 	authfile = fopen(filename, "r");
+ 	if (authfile == NULL) {
+diff -bpur dropbear-2016.73/svr-chansession.c dropbear-2016.73-Android/svr-chansession.c
+--- dropbear-2016.73/svr-chansession.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/svr-chansession.c	2016-04-03 20:10:34.179898277 +1000
+@@ -588,10 +588,17 @@ static int sessionpty(struct ChanSess *
+ 		dropbear_exit("Out of memory"); /* TODO disconnect */
+ 	}
+ 
++    if (svr_opts.android_mode) {
++    	pw = malloc(sizeof(struct passwd));
++    	pw->pw_uid = svr_opts.uid;
++    	pw->pw_gid = svr_opts.gid;
++    } else
+ 	pw = getpwnam(ses.authstate.pw_name);
+ 	if (!pw)
+ 		dropbear_exit("getpwnam failed after succeeding previously");
+ 	pty_setowner(pw, chansess->tty);
++   	if (svr_opts.android_mode)
++    	free(pw);
+ 
+ 	/* Set up the rows/col counts */
+ 	sessionwinchange(chansess);
+@@ -948,6 +955,17 @@ static void execchild(void *user_data) {
+ 	addnewvar("LOGNAME", ses.authstate.pw_name);
+ 	addnewvar("HOME", ses.authstate.pw_dir);
+ 	addnewvar("SHELL", get_user_shell());
++    if (svr_opts.android_mode) {
++    	addnewvar("PATH", "/sbin:/system/sbin:/system/bin:/system/xbin");
++      	addnewvar("ANDROID_ASSETS", "/system/app");
++      	addnewvar("ANDROID_BOOTLOGO", "1");
++      	addnewvar("ANDROID_DATA", "/data");
++      	addnewvar("ANDROID_PROPERTY_WORKSPACE", "10,32768");
++      	addnewvar("ANDROID_ROOT", "/system");
++      	addnewvar("BOOTCLASSPATH", "/system/framework/core.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/android.policy.jar:/system/framework/services.jar");
++      	addnewvar("EXTERNAL_STORAGE", "/sdcard");
++      	addnewvar("LD_LIBRARY_PATH", "/system/lib");
++   	} else
+ 	addnewvar("PATH", DEFAULT_PATH);
+ 	if (chansess->term != NULL) {
+ 		addnewvar("TERM", chansess->term);
+diff -bpur dropbear-2016.73/svr-runopts.c dropbear-2016.73-Android/svr-runopts.c
+--- dropbear-2016.73/svr-runopts.c	2016-03-19 01:44:43.000000000 +1100
++++ dropbear-2016.73-Android/svr-runopts.c	2016-04-03 20:19:51.166211152 +1000
+@@ -41,6 +41,12 @@ static void printhelp(const char * progn
+ 
+ 	fprintf(stderr, "Dropbear server v%s https://matt.ucc.asn.au/dropbear/dropbear.html\n"
+ 					"Usage: %s [options]\n"
++                	"-A Android Mode, specify a user explicitly\n"
++                	"-N Android Mode, user name\n"
++                	"-C Android Mode, password\n"
++                	"-R Android Mode, public key file (authorized_keys)\n"               
++                	"-U Android Mode, UID\n"
++                	"-G Android Mode, GID\n"
+ 					"-b bannerfile	Display the contents of bannerfile"
+ 					" before user login\n"
+ 					"		(default: none)\n"
+@@ -55,9 +61,6 @@ static void printhelp(const char * progn
+ #ifdef DROPBEAR_ECDSA
+ 					"		ecdsa %s\n"
+ #endif
+-#ifdef DROPBEAR_DELAY_HOSTKEY
+-					"-R		Create hostkeys as required\n" 
+-#endif
+ 					"-F		Don't fork into background\n"
+ #ifdef DISABLE_SYSLOG
+ 					"(Syslog support not compiled in, using stderr)\n"
+@@ -115,6 +118,7 @@ void svr_getopts(int argc, char ** argv)
+ 	unsigned int i, j;
+ 	char ** next = 0;
+ 	int nextisport = 0;
++	int nextisint = 0;
+ 	char* recv_window_arg = NULL;
+ 	char* keepalive_arg = NULL;
+ 	char* idle_timeout_arg = NULL;
+@@ -135,6 +139,12 @@ void svr_getopts(int argc, char ** argv)
+ 	svr_opts.hostkey = NULL;
+ 	svr_opts.delay_hostkey = 0;
+ 	svr_opts.pidfile = DROPBEAR_PIDFILE;
++   	svr_opts.android_mode = 0;
++   	svr_opts.user_name = NULL;
++   	svr_opts.passwd = NULL;
++   	svr_opts.authkey = NULL;
++   	svr_opts.uid = 0;
++   	svr_opts.gid = 0;
+ #ifdef ENABLE_SVR_LOCALTCPFWD
+ 	svr_opts.nolocaltcp = 0;
+ #endif
+@@ -174,6 +184,26 @@ void svr_getopts(int argc, char ** argv)
+ 
+ 		for (j = 1; (c = argv[i][j]) != '\0' && !next && !nextisport; j++) {
+ 			switch (c) {
++            	case 'A':
++               		svr_opts.android_mode = 1;
++               		break;
++            	case 'N':
++	               next = &svr_opts.user_name;
++	               break;
++	            case 'C':
++	               next = &svr_opts.passwd;
++	               break;
++	            case 'R':
++	               next = &svr_opts.authkey;
++	               break;
++	            case 'U':
++	               next = &svr_opts.uid;
++	               nextisint = 1;
++	               break;
++	            case 'G':
++	               next = &svr_opts.gid;
++	               nextisint = 1;
++	               break;
+ 				case 'b':
+ 					next = &svr_opts.bannerfile;
+ 					break;
+@@ -181,9 +211,6 @@ void svr_getopts(int argc, char ** argv)
+ 				case 'r':
+ 					next = &keyfile;
+ 					break;
+-				case 'R':
+-					svr_opts.delay_hostkey = 1;
+-					break;
+ 				case 'F':
+ 					svr_opts.forkbg = 0;
+ 					break;
